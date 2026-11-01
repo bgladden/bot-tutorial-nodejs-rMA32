@@ -1,0 +1,132 @@
+; ---------------------------------------------------------------------------
+; Behringer Ultranet receiver for RP2350 PIO
+;
+; One state machine decodes one Ultranet pair (8 channels).  The line is
+; AES3-style biphase-mark at 24.576 MBd (UI = 40.69 ns).  The SM runs at the
+; system clock, which main.c sets to 196.5 MHz so that T = 8 SM cycles ~= 1 UI
+; (196.608 MHz would be exact; the 0.055 % error is harmless, see PROTOCOL.md).
+;
+; Strategy: after every edge that starts a bit cell, sample the line at 1.5 UI
+; and (if it has not changed) again at 2.5 UI:
+;     changed at 1.5 UI          -> run of 1 UI -> first half of a '1' bit
+;     changed at 2.5 UI          -> run of 2 UI -> a '0' bit
+;     unchanged at 2.5 UI        -> run of 3 UI -> preamble
+; Two copies of the cell decoder exist (eh = line high, el = line low).
+;
+; Polarity: with even parity every subframe has an even number of transitions,
+; so the preamble always starts with the SAME line level.  The program assumes
+; it is a HIGH run ("111..."), which is what Behringer gear produces with the
+; wiring in DEVICE_DESIGN.md.  If the pair is wired the other way round no
+; valid words appear and main.c flips the GPIO input inversion.
+;
+; Output: one 32-bit word per subframe, pushed at the NEXT preamble:
+;     bits [3:0]  preamble code: X = 0x9 (OSR), Y = 0x6 (Y reg), Z = 0xF (X reg)
+;     bits [31:4] AES3 time slots 4..31 (bit n of the word == AES3 slot n)
+; The ISR shifts right, so the first bit received ends up in bit 0.
+;
+; Pacing: every preamble also raises PIO IRQ flag (0 + SM number), which the
+; I2S output SM in the next PIO block waits on.  That makes the output clock
+; exactly follow the incoming Ultranet sample clock.
+;
+; Registers preset by main.c before start:  X = 0x1F, Y = 0x6, OSR = 0x9
+; ---------------------------------------------------------------------------
+
+.pio_version 1
+.program ultranet_rx
+
+.define PUBLIC T 8                      ; SM cycles per UI
+.define S1 (T + T/2 - 1)                ; wait delay -> sample at 1.5 UI
+.define S2 (T - 2)                      ; nop delay  -> sample at 2.5 UI
+.define J0 (T - 3)                      ; '0' found at 2.5 UI -> next sample at 3.5 UI
+.define J1 (2*T - 3)                    ; '0' found at 1.5 UI -> next sample at 3.5 UI
+
+; ----- preamble (entered 2.5 UI into the initial 3-UI high run) ------------
+pre_h:
+    push noblock                        ; previous subframe -> RX FIFO
+    irq set 0 rel                       ; pace the I2S output SM
+    wait 0 pin 0        [S1]            ; edge at UI 3; sample in UI 4
+    jmp pin pre_z                       ; UI4 high -> Z  (111 0 1 000)
+    nop                 [S2]            ; sample in UI 5
+    jmp pin pre_y                       ; UI5 high -> Y  (111 00 1 00)
+    in osr, 4                           ; X: code 0x9    (111 000 1 0)
+    wait 1 pin 0                        ; X: rise at UI 6
+tail:
+    wait 0 pin 0                        ; last fall inside the preamble
+; ----- cell starting with a rising edge ------------------------------------
+public eh:
+    wait 1 pin 0        [S1]            ; cell start (line goes high)
+eh_s:
+    jmp pin eh_long                     ; still high at 1.5 UI?
+    in x, 1                             ; no: mid-cell edge -> '1'
+    jmp eh                              ; next cell starts with a rising edge
+eh_long:
+    nop                 [S2]
+    jmp pin pre_h                       ; still high at 2.5 UI -> 3-UI run: preamble
+    in null, 1                          ; '0'; next cell began low at 2 UI
+    jmp el_s            [J0]
+; ----- cell starting with a falling edge -----------------------------------
+el:
+    wait 0 pin 0        [S1]
+el_s:
+    jmp pin el_one                      ; went high at 1 UI -> '1'
+    in null, 1                          ; '0' (3-UI low runs never occur with
+    jmp eh_s            [J1]            ;      correct polarity)
+el_one:
+    in x, 1
+    jmp el
+pre_y:
+    in y, 4                             ; Y: code 0x6
+    jmp tail
+pre_z:
+    in x, 4                             ; Z: code 0xF
+    jmp tail
+
+
+; ---------------------------------------------------------------------------
+; Free-running pacer: stands in for the decoder when no Ultranet signal is
+; present so the USB bridge keeps getting a clock (silence).  Sets IRQ 0 every
+; 498 SM cycles; main.c sets clkdiv ~1.0273 -> ~384 kHz.
+; ---------------------------------------------------------------------------
+.program pacer
+.wrap_target
+    irq set 0
+    set x, 30
+loop:
+    jmp x-- loop        [15]
+.wrap
+
+
+; ---------------------------------------------------------------------------
+; 8-line I2S transmitter (16 channels @ 48 kHz) - runs in the NEXT PIO block.
+;
+; out pins (9): SD0..SD7, LRCLK      side-set (2): bit0 = BCLK, bit1 = MCLK
+; Each TX word carries two bit-times: bits[8:0] then bits[24:16].
+; main.c / ultranet_core.c pre-compute LRCLK and the I2S one-bit delay, so this
+; program only clocks bits out: 8 bit-times per incoming Ultranet subframe
+; (8 x 8 subframes = 64 BCLK = one 48 kHz I2S frame).
+;
+; Each bit is 16 SM cycles (8 low / 8 high) and carries 4 MCLK periods, so
+; MCLK = 256 fs (12.288 MHz) and is phase-locked to BCLK - and therefore to
+; the Ultranet source.  USB bridges such as XMOS lib_xua count MCLK to size
+; their USB packets, so a locked MCLK matters.
+;
+; With clkdiv ~3.883 a chunk of 8 bits (130 SM cycles) takes ~505 sys cycles,
+; a little shorter than one subframe (511.7), so the SM always waits a few
+; cycles for the next IRQ: the output rate is locked to the Ultranet source,
+; with a slightly longer BCLK/MCLK low phase once every 8 bits.
+; ---------------------------------------------------------------------------
+.program i2s8_out
+.side_set 2
+.wrap_target
+    wait 1 irq prev, 0      side 0b00   ; one tick per Ultranet subframe (stream A)
+    set y, 7                side 0b00
+bitloop:
+    out pins, 16            side 0b00 [1]   ; data + LRCLK change on falling BCLK
+    nop                     side 0b10 [1]
+    nop                     side 0b00 [1]
+    nop                     side 0b10 [1]
+    nop                     side 0b01 [1]   ; receiver samples on rising BCLK
+    nop                     side 0b11 [1]
+    nop                     side 0b01 [1]
+    jmp y-- bitloop         side 0b11 [1]
+.wrap
