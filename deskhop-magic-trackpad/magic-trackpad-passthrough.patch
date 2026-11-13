@@ -1,0 +1,1770 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index a83f8f2..6eabd95 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -64,6 +64,7 @@ set(COMMON_SOURCES
+   ${SRC_DIR}/setup.c
+   ${SRC_DIR}/keyboard.c
+   ${SRC_DIR}/mouse.c
++  ${SRC_DIR}/trackpad.c
+   ${SRC_DIR}/tasks.c
+   ${SRC_DIR}/led.c
+   ${SRC_DIR}/uart.c
+diff --git a/src/include/constants.h b/src/include/constants.h
+index 3362051..e1b2875 100644
+--- a/src/include/constants.h
++++ b/src/include/constants.h
+@@ -22,9 +22,17 @@
+  *  HID Interface Numbers
+  *==============================================================================*/
+ 
+-#define ITF_NUM_HID        0
+-#define ITF_NUM_HID_REL_M  1
+-#define ITF_NUM_HID_VENDOR 2
++/* Position of DeskHop's own HID interfaces, before any cloned trackpad interfaces */
++#define ITF_IDX_HID        0
++#define ITF_IDX_HID_REL_M  1
++#define ITF_IDX_HID_VENDOR 2
++
++/* Actual HID instance numbers. When a Magic Trackpad is being passed through,
++   its cloned interfaces come first and ours are shifted up by tp_itf_base. */
++extern volatile uint8_t tp_itf_base;
++#define ITF_NUM_HID        (tp_itf_base + ITF_IDX_HID)
++#define ITF_NUM_HID_REL_M  (tp_itf_base + ITF_IDX_HID_REL_M)
++#define ITF_NUM_HID_VENDOR (tp_itf_base + ITF_IDX_HID_VENDOR)
+ #define ITF_NUM_MSC        3
+ 
+ /*==============================================================================
+diff --git a/src/include/main.h b/src/include/main.h
+index 4fb63a5..40d0068 100644
+--- a/src/include/main.h
++++ b/src/include/main.h
+@@ -44,6 +44,7 @@
+ #include "serial.h"
+ #include "setup.h"
+ #include "tasks.h"
++#include "trackpad.h"
+ #include "watchdog.h"
+ 
+ 
+diff --git a/src/include/mouse.h b/src/include/mouse.h
+index 7e098fa..6b06b6e 100644
+--- a/src/include/mouse.h
++++ b/src/include/mouse.h
+@@ -24,6 +24,7 @@ void      parse_report_descriptor(hid_interface_t *, uint8_t const *, int);
+  *  Mouse Report Handling
+  *==============================================================================*/
+ void process_mouse_report(uint8_t *, int, uint8_t, hid_interface_t *);
++void process_mouse_values(mouse_values_t *);
+ void queue_mouse_report(mouse_report_t *, device_t *);
+ bool tud_mouse_report(uint8_t mode, uint8_t buttons, int16_t x, int16_t y, int8_t wheel, int8_t pan);
+ void output_mouse_report(mouse_report_t *, device_t *);
+diff --git a/src/include/protocol.h b/src/include/protocol.h
+index 2b947fd..1c433fe 100644
+--- a/src/include/protocol.h
++++ b/src/include/protocol.h
+@@ -36,6 +36,10 @@ enum packet_type_e {
+     PROXY_PACKET_MSG     = 23,
+     REQUEST_BYTE_MSG     = 24,
+     RESPONSE_BYTE_MSG    = 25,
++    TP_FRAME_BEGIN_MSG   = 26,
++    TP_FRAME_DATA_MSG    = 27,
++    TP_GET_REQ_MSG       = 28,
++    TP_SYNC_REQ_MSG      = 29,
+ };
+ 
+ typedef enum {
+diff --git a/src/include/trackpad.h b/src/include/trackpad.h
+new file mode 100644
+index 0000000..21b353f
+--- /dev/null
++++ b/src/include/trackpad.h
+@@ -0,0 +1,93 @@
++/*
++ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
++ *
++ * Apple Magic Trackpad passthrough ("solution A").
++ *
++ * When a Magic Trackpad is plugged into either board, both boards re-enumerate
++ * towards their computers as a clone of that trackpad (same VID/PID, strings,
++ * HID interfaces and report descriptors), with the usual DeskHop keyboard and
++ * mouse interfaces appended after the cloned ones. Raw reports from the
++ * trackpad are forwarded unmodified to the active output only, and HID
++ * GET_REPORT / SET_REPORT requests from the computers are relayed to the real
++ * trackpad, so the OS multitouch driver talks to the genuine device.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, version 3.
++ */
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "structs.h"
++
++/* How many HID interfaces of the trackpad we are able to clone */
++#define TP_MAX_ITF      4
++/* Shared storage for all cloned HID report descriptors */
++#define TP_RDESC_POOL   1536
++/* Longest string descriptor we clone, in UTF-16 units including the header */
++#define TP_STR_UNITS    33
++/* Largest GET_REPORT / SET_REPORT payload we relay */
++#define TP_CTRL_MAX     256
++/* Largest interrupt packet (full speed) */
++#define TP_PKT_MAX      64
++
++#define TP_MAGIC        0x54504d32 /* "TPM2" */
++
++typedef struct TU_ATTR_PACKED {
++    uint8_t  itf_num;         /* bInterfaceNumber on the real trackpad */
++    uint8_t  subclass;
++    uint8_t  protocol;
++    uint8_t  country;
++    uint16_t bcd_hid;
++    uint16_t rdesc_len;
++    uint16_t rdesc_off;       /* Offset into the descriptor pool */
++    uint8_t  ep_in;           /* 0 if absent */
++    uint8_t  ep_in_interval;
++    uint16_t ep_in_size;
++    uint8_t  ep_out;          /* 0 if absent */
++    uint8_t  ep_out_interval;
++    uint16_t ep_out_size;
++} tp_itf_t;
++
++/* Everything needed to impersonate the trackpad. Sent over UART as-is, both
++   boards run the same firmware so the layout matches. */
++typedef struct {
++    uint32_t magic;
++    uint8_t  n_itf;
++    uint8_t  cfg_attr;
++    uint8_t  cfg_power;
++    uint8_t  _pad;
++    tusb_desc_device_t dev;
++    tp_itf_t itf[TP_MAX_ITF];
++    uint16_t str[3][TP_STR_UNITS]; /* Raw manufacturer / product / serial string descriptors */
++    uint16_t pool_len;
++    uint8_t  pool[TP_RDESC_POOL];
++} tp_profile_t;
++
++/* Number of HID instances occupied by the cloned trackpad (0 when inactive).
++   DeskHop's own HID instances are shifted up by this much. */
++extern volatile uint8_t tp_itf_base;
++
++void tp_init(void);
++
++/* ---- Device side (core 0) ---- */
++bool tp_active(void);
++const tp_profile_t *tp_profile(void);
++void tp_device_task(device_t *state);
++uint16_t tp_dev_get_report(uint8_t slot, uint8_t report_id, uint8_t report_type, uint8_t *buffer, uint16_t reqlen);
++void tp_dev_set_report(uint8_t slot, uint8_t report_id, uint8_t report_type, const uint8_t *buffer, uint16_t len);
++
++/* ---- Host side (core 1) ---- */
++bool tp_host_is_trackpad(uint8_t dev_addr);
++void tp_host_itf_mounted(uint8_t dev_addr, uint8_t instance);
++bool tp_host_unmounted(uint8_t dev_addr);
++void tp_host_input(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len);
++void tp_host_task(device_t *state);
++
++/* ---- UART handlers ---- */
++void handle_tp_frame_begin_msg(uart_packet_t *packet, device_t *state);
++void handle_tp_frame_data_msg(uart_packet_t *packet, device_t *state);
++void handle_tp_get_req_msg(uart_packet_t *packet, device_t *state);
++void handle_tp_sync_req_msg(uart_packet_t *packet, device_t *state);
+diff --git a/src/include/tusb_config.h b/src/include/tusb_config.h
+index b729178..485f96b 100644
+--- a/src/include/tusb_config.h
++++ b/src/include/tusb_config.h
+@@ -116,7 +116,8 @@ extern int dh_debug_printf(const char *__restrict __format, ...);
+  *==============================================================================*/
+ 
+ // Enable HID (Human Interface Device) class (keyboard, mouse, etc.).
+-#define CFG_TUD_HID    3
++// 3 of our own, plus up to 4 cloned from a passed-through Magic Trackpad.
++#define CFG_TUD_HID    7
+ 
+ // Enable MSC (Mass Storage Class) class.
+ #define CFG_TUD_MSC    1
+@@ -127,7 +128,11 @@ extern int dh_debug_printf(const char *__restrict __format, ...);
+  *==============================================================================*/
+ 
+ // HID endpoint buffer size (must be large enough for report ID + data).
+-#define CFG_TUD_HID_EP_BUFSIZE 32
++// Also bounds GET_REPORT / SET_REPORT payloads relayed to a Magic Trackpad.
++#define CFG_TUD_HID_EP_BUFSIZE 256
++
++// wMaxPacketSize of DeskHop's own HID endpoints.
++#define DH_HID_EP_SIZE 32
+ 
+ // MSC endpoint buffer size.
+ #define CFG_TUD_MSC_EP_BUFSIZE 512
+@@ -137,7 +142,7 @@ extern int dh_debug_printf(const char *__restrict __format, ...);
+  *  Configuration for the buffer used during device enumeration.
+  *==============================================================================*/
+ 
+-#define CFG_TUH_ENUMERATION_BUFSIZE 512
++#define CFG_TUH_ENUMERATION_BUFSIZE 1024
+ 
+ /*==============================================================================
+  *  Host: Class Configuration
+diff --git a/src/include/user_config.h b/src/include/user_config.h
+index 81ed7e8..28e04f7 100644
+--- a/src/include/user_config.h
++++ b/src/include/user_config.h
+@@ -226,3 +226,45 @@
+  * */
+ 
+ #define ENFORCE_KEYBOARD_BOOT_PROTOCOL 0
++
++
++/**================================================== *
++ * ==========  Magic Trackpad Passthrough  ========== *
++ * ================================================== *
++ *
++ * When an Apple Magic Trackpad is plugged in (by cable), DeskHop presents
++ * itself to both computers as that trackpad and relays its raw data to the
++ * active one, so macOS uses its own multitouch driver and all native gestures.
++ *
++ * TP_ENABLE: [0, 1] - 1 turns the passthrough on.
++ *
++ * TP_POINTER_MODE: [0, 1]
++ *   0 - Everything is passed through. Pointer movement feels 100% native, but
++ *       DeskHop can't see where the cursor is, so you switch computers with
++ *       the keyboard hotkey.
++ *   1 - EXPERIMENTAL. One finger drives DeskHop's own pointer (so moving past
++ *       the screen edge switches computers, like with a mouse) and is hidden
++ *       from the computer. Two or more fingers are passed through, so scroll,
++ *       pinch and swipe gestures stay native. Pointer acceleration, tap to
++ *       click and drag then come from DeskHop instead of macOS.
++ *
++ * TP_FORWARD_INACTIVE_SETS: [0, 1]
++ *   1 - Configuration requests from both computers reach the trackpad.
++ *   0 - Requests from the computer that isn't selected are only remembered
++ *       and applied when you switch to it.
++ *
++ * The remaining values only apply to TP_POINTER_MODE 1.
++ * */
++
++#define TP_ENABLE 1
++#define TP_POINTER_MODE 0
++#define TP_FORWARD_INACTIVE_SETS 1
++
++/* Trackpad units to mouse counts ratio */
++#define TP_POINTER_SCALE_NUM 1
++#define TP_POINTER_SCALE_DEN 6
++
++/* A touch shorter and stiller than this is a click */
++#define TP_TAP_TO_CLICK 1
++#define TP_TAP_MAX_US 180000
++#define TP_TAP_MAX_TRAVEL 60
+diff --git a/src/main.c b/src/main.c
+index 6f682b7..c6ce751 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -30,6 +30,7 @@ int main(void) {
+         [3] = {.exec = &process_mouse_queue_task, .frequency = _HZ(2000)},   // | Check if there were any mouse movements and send them
+         [4] = {.exec = &process_hid_queue_task,   .frequency = _HZ(1000)},   // | Check if there are any packets to send over vendor link
+         [5] = {.exec = &process_uart_tx_task,     .frequency = _TOP()},      // | Check if there are any packets to send over UART
++        [6] = {.exec = &tp_device_task,           .frequency = _TOP()},      // | Magic Trackpad passthrough, device side
+     };                                                                       // `----- then go back and repeat forever
+     const int NUM_TASKS = ARRAY_SIZE(tasks_core0);
+ 
+@@ -63,6 +64,7 @@ void core1_main() {
+         [4] = {.exec = &screensaver_task,        .frequency = _HZ(120)},     // | Handle "screensaver" movements
+         [5] = {.exec = &firmware_upgrade_task,   .frequency = _HZ(4000)},    // | Send firmware to the other board if needed
+         [6] = {.exec = &heartbeat_output_task,   .frequency = _HZ(1)},       // | Output periodic heartbeats
++        [7] = {.exec = &tp_host_task,            .frequency = _HZ(2000)},    // | Magic Trackpad passthrough, host side
+     };                                                                       // `----- then go back and repeat forever
+     const int NUM_TASKS = ARRAY_SIZE(tasks_core1);
+ 
+diff --git a/src/mouse.c b/src/mouse.c
+index 6bd4344..74555bb 100644
+--- a/src/mouse.c
++++ b/src/mouse.c
+@@ -367,11 +367,18 @@ void process_mouse_report(uint8_t *raw_report, int len, uint8_t itf, hid_interfa
+         return;
+     }
+ 
++    process_mouse_values(&values);
++}
++
++/* Move the pointer by already-decoded values (also used by the trackpad pointer mode) */
++void process_mouse_values(mouse_values_t *values) {
++    device_t *state = &global_state;
++
+     /* Calculate and update mouse pointer movement. */
+-    enum screen_pos_e switch_direction = update_mouse_position(state, &values);
++    enum screen_pos_e switch_direction = update_mouse_position(state, values);
+ 
+     /* Create the report for the output PC based on the updated values */
+-    mouse_report_t report = create_mouse_report(state, &values);
++    mouse_report_t report = create_mouse_report(state, values);
+ 
+     /* Move the mouse, depending where the output is supposed to go */
+     output_mouse_report(&report, state);
+diff --git a/src/setup.c b/src/setup.c
+index 5b04828..a8c07fd 100644
+--- a/src/setup.c
++++ b/src/setup.c
+@@ -237,6 +237,9 @@ void initial_setup(device_t *state) {
+     /* Initialize UART queue */
+     queue_init(&state->uart_tx_queue, sizeof(uart_packet_t), UART_QUEUE_LENGTH);
+ 
++    /* Initialize Magic Trackpad passthrough */
++    tp_init();
++
+     /* Apply the configured default for gaming mode (relative mode + switching lock) */
+     state->gaming_mode = state->config.gaming_mode_default;
+ 
+diff --git a/src/trackpad.c b/src/trackpad.c
+new file mode 100644
+index 0000000..a3153f4
+--- /dev/null
++++ b/src/trackpad.c
+@@ -0,0 +1,1129 @@
++/*
++ * This file is part of DeskHop (https://github.com/hrvach/deskhop).
++ *
++ * Apple Magic Trackpad passthrough. See include/trackpad.h for the overview.
++ *
++ * Threading model (same as the rest of DeskHop):
++ *   core 0 - USB device stack, talks to the computer
++ *   core 1 - USB host stack, talks to the trackpad; UART receiver
++ * Everything crossing between the two goes through pico queues.
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, version 3.
++ */
++
++#include "main.h"
++
++#if TP_ENABLE
++
++#define USB_VID_APPLE 0x05ac
++
++/* Wired Magic Trackpad models we recognise */
++static const uint16_t tp_known_pids[] = {
++    0x0265, /* Magic Trackpad 2 (Lightning) */
++    0x0324, /* Magic Trackpad (USB-C) */
++};
++
++/* The multitouch report: 12 byte header followed by 9 bytes per finger */
++#define TP_MT_REPORT_ID  0x02
++#define TP_MT_HEADER_LEN 12
++#define TP_MT_FINGER_LEN 9
++
++enum { TP_S_PROFILE = 0, TP_S_INPUT, TP_S_SET, TP_S_GET_RESP, TP_S_COUNT };
++enum { TP_OP_SET = 0, TP_OP_OUT, TP_OP_GET };
++
++#define TP_GET_TIMEOUT_US  250000
++#define TP_CTRL_TIMEOUT_US 400000
++#define TP_RECONNECT_US    500000
++#define TP_MAX_RECORDS     8
++#define TP_RECORD_MAX      64
++
++typedef struct {
++    uint8_t slot;
++    uint8_t len;
++    uint8_t data[TP_PKT_MAX];
++} tp_in_t;
++
++typedef struct {
++    uint8_t  op;
++    uint8_t  output; /* Which computer asked */
++    uint8_t  slot;
++    uint8_t  rtype;
++    uint8_t  rid;
++    uint8_t  remote; /* Request came from the other board */
++    uint8_t  token;
++    uint16_t len;
++    uint8_t  data[TP_CTRL_MAX];
++} tp_job_t;
++
++/* Last feature report each computer has set, replayed when switching to it */
++typedef struct {
++    bool     used;
++    uint8_t  slot;
++    uint8_t  rid;
++    uint8_t  len;
++    uint32_t seq;
++    uint8_t  data[TP_RECORD_MAX];
++} tp_record_t;
++
++typedef struct {
++    uint8_t *buf;
++    uint16_t cap;
++    uint16_t len;
++    uint16_t got;
++    uint8_t  sum;
++    uint8_t  meta[4];
++    bool     open;
++} tp_rx_t;
++
++/* ---------------- Shared state ---------------- */
++
++volatile uint8_t tp_itf_base = 0;
++
++static tp_profile_t tp_stage;   /* Written on core 1 (capture or UART) */
++static tp_profile_t tp_prof;    /* What core 0 presents to the computer */
++static tp_profile_t tp_rx_prof; /* UART reassembly buffer */
++
++static volatile bool tp_stage_valid;
++static volatile bool tp_apply_pending;
++static volatile bool tp_is_active;
++static volatile bool tp_owner; /* Trackpad is plugged into this board and captured */
++
++static queue_t tp_in_q;
++static queue_t tp_job_q;
++
++/* GET_REPORT rendezvous, core 0 waits for core 1 (or the other board) */
++static volatile bool    tp_get_done;
++static volatile bool    tp_get_ok;
++static volatile uint8_t tp_get_token;
++static volatile uint16_t tp_get_len;
++static uint8_t tp_get_buf[TP_CTRL_MAX];
++
++/* ---------------- Logging (debug builds only) ---------------- */
++
++#ifdef DH_DEBUG
++typedef struct {
++    char s[88];
++} tp_logline_t;
++static queue_t tp_log_q;
++
++static void tp_log(const char *fmt, ...) {
++    tp_logline_t line;
++    va_list args;
++    va_start(args, fmt);
++    vsnprintf(line.s, sizeof(line.s), fmt, args);
++    va_end(args);
++    queue_try_add(&tp_log_q, &line);
++}
++
++static void tp_log_flush(void) {
++    static tp_logline_t line;
++    if (queue_try_remove(&tp_log_q, &line))
++        dh_debug_printf("[tp] %s\r\n", line.s);
++}
++#else
++#define tp_log(...) ((void)0)
++#define tp_log_flush() ((void)0)
++#endif
++
++/* ---------------- UART framing ---------------- */
++
++static uint8_t tp_rx_input_buf[TP_PKT_MAX];
++static uint8_t tp_rx_set_buf[TP_CTRL_MAX];
++static uint8_t tp_rx_get_buf[TP_CTRL_MAX];
++
++static tp_rx_t tp_rx[TP_S_COUNT] = {
++    [TP_S_PROFILE]  = {.buf = (uint8_t *)&tp_rx_prof, .cap = sizeof(tp_rx_prof)},
++    [TP_S_INPUT]    = {.buf = tp_rx_input_buf, .cap = sizeof(tp_rx_input_buf)},
++    [TP_S_SET]      = {.buf = tp_rx_set_buf, .cap = sizeof(tp_rx_set_buf)},
++    [TP_S_GET_RESP] = {.buf = tp_rx_get_buf, .cap = sizeof(tp_rx_get_buf)},
++};
++
++static uint8_t tp_sum(const uint8_t *data, uint16_t len) {
++    uint8_t sum = 0x5a;
++    for (uint16_t i = 0; i < len; i++)
++        sum = (uint8_t)((sum << 1) | (sum >> 7)) ^ data[i];
++    return sum;
++}
++
++/* Queue a packet for the other board. Waits briefly if the queue is full. */
++static bool tp_uart_put(const uart_packet_t *packet) {
++    uint64_t deadline = time_us_64() + 20000;
++
++    while (!queue_try_add(&global_state.uart_tx_queue, packet)) {
++        if (time_us_64() > deadline)
++            return false;
++
++        /* Core 0 is the one draining the queue, so help ourselves */
++        if (get_core_num() == 0)
++            process_uart_tx_task(&global_state);
++    }
++    return true;
++}
++
++static bool tp_send_begin(uint8_t stream, const uint8_t meta[4], const uint8_t *data, uint16_t len) {
++    uart_packet_t packet = {.type = TP_FRAME_BEGIN_MSG};
++
++    packet.data[0] = stream;
++    packet.data[1] = (uint8_t)(len & 0xff);
++    packet.data[2] = (uint8_t)(len >> 8);
++    packet.data[3] = tp_sum(data, len);
++    if (meta != NULL)
++        memcpy(&packet.data[4], meta, 4);
++
++    return tp_uart_put(&packet);
++}
++
++/* Send up to 7 payload bytes, returns how many were consumed (0 on failure) */
++static uint16_t tp_send_data(uint8_t stream, const uint8_t *data, uint16_t len) {
++    uart_packet_t packet = {.type = TP_FRAME_DATA_MSG};
++    uint16_t chunk = (len > 7) ? 7 : len;
++
++    packet.data[0] = stream;
++    memcpy(&packet.data[1], data, chunk);
++
++    return tp_uart_put(&packet) ? chunk : 0;
++}
++
++static bool tp_send_frame(uint8_t stream, const uint8_t meta[4], const uint8_t *data, uint16_t len) {
++    if (!tp_send_begin(stream, meta, data, len))
++        return false;
++
++    for (uint16_t off = 0; off < len;) {
++        uint16_t sent = tp_send_data(stream, data + off, len - off);
++        if (!sent)
++            return false;
++        off += sent;
++    }
++    return true;
++}
++
++/* ---------------- Device side (core 0) ---------------- */
++
++bool tp_active(void) {
++    return tp_is_active;
++}
++
++const tp_profile_t *tp_profile(void) {
++    return &tp_prof;
++}
++
++void tp_device_task(device_t *state) {
++    static bool reconnecting       = false;
++    static uint64_t reconnect_at   = 0;
++    static tp_in_t in;
++
++    tp_log_flush();
++
++    /* A new profile is waiting: drop off the bus, swap descriptors, come back as the trackpad */
++    if (tp_apply_pending && !reconnecting && !state->config_mode_active) {
++        tp_apply_pending = false;
++        tud_disconnect();
++
++        tp_is_active = false;
++        memcpy(&tp_prof, &tp_stage, sizeof(tp_prof));
++        tp_itf_base  = tp_prof.n_itf;
++        tp_is_active = true;
++
++        reconnecting = true;
++        reconnect_at = time_us_64() + TP_RECONNECT_US;
++    }
++
++    if (reconnecting) {
++        if (time_us_64() < reconnect_at)
++            return;
++
++        tud_connect();
++        reconnecting = false;
++        tp_log("re-enumerating as %04x:%04x with %u cloned interfaces", tp_prof.dev.idVendor,
++               tp_prof.dev.idProduct, tp_prof.n_itf);
++    }
++
++    /* Deliver trackpad reports to the computer */
++    if (!queue_try_peek(&tp_in_q, &in))
++        return;
++
++    if (!tp_is_active || in.slot >= tp_prof.n_itf || !tud_mounted()) {
++        queue_try_remove(&tp_in_q, &in);
++        return;
++    }
++
++    if (tud_suspended()) {
++        /* Like the real thing, only a physical click wakes the computer */
++        if (in.len >= TP_MT_HEADER_LEN && in.data[0] == TP_MT_REPORT_ID && (in.data[1] & 0x01))
++            tud_remote_wakeup();
++
++        queue_try_remove(&tp_in_q, &in);
++        return;
++    }
++
++    if (!tud_hid_n_ready(in.slot))
++        return;
++
++    /* Report ID 0 means "send the buffer verbatim", it already carries the trackpad's own ID */
++    if (tud_hid_n_report(in.slot, 0, in.data, in.len))
++        queue_try_remove(&tp_in_q, &in);
++}
++
++/* Computer asks for a report. Relay to the real trackpad and wait for the answer. */
++uint16_t tp_dev_get_report(uint8_t slot, uint8_t report_id, uint8_t report_type, uint8_t *buffer, uint16_t reqlen) {
++    static tp_job_t job;
++    uint16_t want = reqlen + (report_id ? 1 : 0);
++    uint8_t token = (uint8_t)(tp_get_token + 1);
++
++    if (want > TP_CTRL_MAX)
++        want = TP_CTRL_MAX;
++
++    tp_get_done  = false;
++    tp_get_token = token;
++
++    if (tp_owner) {
++        job = (tp_job_t){.op = TP_OP_GET, .output = BOARD_ROLE, .slot = slot, .rtype = report_type,
++                         .rid = report_id, .remote = false, .token = token, .len = want};
++        if (!queue_try_add(&tp_job_q, &job))
++            return 0;
++    } else {
++        uart_packet_t packet = {.type = TP_GET_REQ_MSG};
++        packet.data[0] = slot;
++        packet.data[1] = report_type;
++        packet.data[2] = report_id;
++        packet.data[3] = token;
++        packet.data[4] = (uint8_t)(want & 0xff);
++        packet.data[5] = (uint8_t)(want >> 8);
++        packet.data[6] = BOARD_ROLE;
++        if (!tp_uart_put(&packet))
++            return 0;
++    }
++
++    /* We're inside tud_task() here, so keep the UART moving and the watchdog fed while we wait */
++    uint64_t deadline = time_us_64() + TP_GET_TIMEOUT_US;
++    while (!tp_get_done) {
++        if (time_us_64() > deadline) {
++            tp_log("GET itf=%u type=%u id=%02x timed out", slot, report_type, report_id);
++            return 0;
++        }
++        process_uart_tx_task(&global_state);
++        watchdog_update();
++    }
++
++    if (!tp_get_ok || tp_get_len == 0)
++        return 0;
++
++    const uint8_t *src = tp_get_buf;
++    uint16_t len = tp_get_len;
++
++    /* The trackpad prefixes the report ID, TinyUSB has already added it on our side */
++    if (report_id && src[0] == report_id) {
++        src++;
++        len--;
++    }
++
++    if (len > reqlen)
++        len = reqlen;
++
++    memcpy(buffer, src, len);
++    return len;
++}
++
++/* Computer sets a report (or writes to an OUT endpoint). Relay to the real trackpad. */
++void tp_dev_set_report(uint8_t slot, uint8_t report_id, uint8_t report_type, const uint8_t *buffer, uint16_t len) {
++    static tp_job_t job;
++
++    if (slot >= tp_prof.n_itf)
++        return;
++
++    job = (tp_job_t){.op = TP_OP_SET, .output = BOARD_ROLE, .slot = slot, .rtype = report_type, .rid = report_id};
++
++    /* TinyUSB reports OUT endpoint data as an output report with ID 0 */
++    if (report_type == HID_REPORT_TYPE_OUTPUT && report_id == 0 && tp_prof.itf[slot].ep_out)
++        job.op = TP_OP_OUT;
++
++    /* TinyUSB stripped the leading report ID, the trackpad wants it back */
++    uint16_t prefix = (job.op == TP_OP_SET && report_id) ? 1 : 0;
++
++    if (len + prefix > TP_CTRL_MAX)
++        return;
++
++    job.data[0] = report_id;
++    memcpy(&job.data[prefix], buffer, len);
++    job.len = len + prefix;
++
++    if (tp_owner) {
++        queue_try_add(&tp_job_q, &job);
++    } else {
++        uint8_t meta[4] = {slot, report_type, report_id, (uint8_t)(BOARD_ROLE | (job.op << 4))};
++        tp_send_frame(TP_S_SET, meta, job.data, job.len);
++    }
++}
++
++/* ---------------- Host side (core 1) ---------------- */
++
++static uint8_t tp_daddr = 0;
++static bool tp_capture_pending = false;
++static uint64_t tp_capture_at  = 0;
++static int8_t tp_host_idx[TP_MAX_ITF];
++
++static tp_record_t tp_records[NUM_SCREENS][TP_MAX_RECORDS];
++static uint32_t tp_record_seq = 0;
++
++static volatile bool tp_ctrl_done;
++static volatile xfer_result_t tp_ctrl_result;
++static volatile uint16_t tp_ctrl_actual;
++static uint8_t tp_ctrl_buf[TP_CTRL_MAX];
++static uint8_t tp_cfg_buf[512];
++
++/* For lifting all fingers on the computer we're switching away from */
++static uint8_t tp_last_hdr[TP_MT_HEADER_LEN];
++static uint8_t tp_last_slot;
++static bool tp_touch_live = false;
++
++static int32_t tp_prof_tx_off = -1; /* -1 = idle */
++static bool tp_prof_tx_request = false;
++
++static inline void tp_core1_alive(void) {
++    global_state.core1_last_loop_pass = time_us_32();
++}
++
++static void tp_ctrl_cb(tuh_xfer_t *xfer) {
++    tp_ctrl_result = xfer->result;
++    tp_ctrl_actual = (uint16_t)xfer->actual_len;
++    tp_ctrl_done   = true;
++}
++
++/* Blocking control transfer to the trackpad, with a timeout. Must only be called
++   from the core 1 task loop (never from inside a TinyUSB callback). */
++static bool tp_ctrl(uint8_t bm_request_type, uint8_t request, uint16_t value, uint16_t index, void *buffer,
++                    uint16_t len, uint16_t *actual) {
++    tusb_control_request_t setup = {
++        .bmRequestType = bm_request_type,
++        .bRequest      = request,
++        .wValue        = tu_htole16(value),
++        .wIndex        = tu_htole16(index),
++        .wLength       = tu_htole16(len),
++    };
++    tuh_xfer_t xfer = {
++        .daddr       = tp_daddr,
++        .ep_addr     = 0,
++        .setup       = &setup,
++        .buffer      = buffer,
++        .complete_cb = tp_ctrl_cb,
++    };
++
++    if (!tp_daddr)
++        return false;
++
++    uint64_t deadline = time_us_64() + TP_CTRL_TIMEOUT_US;
++    tp_ctrl_done = false;
++
++    /* The control pipe may be busy with another transfer, retry until it frees up */
++    while (!tuh_control_xfer(&xfer)) {
++        if (time_us_64() > deadline || !tp_daddr)
++            return false;
++        tuh_task();
++        tp_core1_alive();
++    }
++
++    while (!tp_ctrl_done) {
++        if (time_us_64() > deadline || !tp_daddr)
++            return false;
++        tuh_task();
++        tp_core1_alive();
++    }
++
++    if (actual != NULL)
++        *actual = tp_ctrl_actual;
++
++    return tp_ctrl_result == XFER_RESULT_SUCCESS;
++}
++
++bool tp_host_is_trackpad(uint8_t dev_addr) {
++    uint16_t vid, pid;
++
++    if (!tuh_vid_pid_get(dev_addr, &vid, &pid) || vid != USB_VID_APPLE)
++        return false;
++
++    for (unsigned i = 0; i < ARRAY_SIZE(tp_known_pids); i++)
++        if (tp_known_pids[i] == pid)
++            return true;
++
++    return false;
++}
++
++/* A HID interface of the trackpad is ready. Start listening right away; descriptors
++   are captured a moment later from the task loop, once all interfaces are up. */
++void tp_host_itf_mounted(uint8_t dev_addr, uint8_t instance) {
++    tp_daddr           = dev_addr;
++    tp_capture_pending = true;
++    tp_capture_at      = time_us_64() + 100000;
++
++    tuh_hid_receive_report(dev_addr, instance);
++}
++
++/* Returns true if the device going away was the trackpad */
++bool tp_host_unmounted(uint8_t dev_addr) {
++    if (dev_addr != tp_daddr)
++        return false;
++
++    tp_daddr           = 0;
++    tp_owner           = false;
++    tp_capture_pending = false;
++    tp_touch_live      = false;
++    return true;
++}
++
++static int tp_slot_from_instance(uint8_t instance) {
++    for (int slot = 0; slot < tp_stage.n_itf; slot++)
++        if (tp_host_idx[slot] == (int8_t)instance)
++            return slot;
++    return -1;
++}
++
++static void tp_map_instances(void) {
++    for (int slot = 0; slot < TP_MAX_ITF; slot++)
++        tp_host_idx[slot] = -1;
++
++    for (uint8_t idx = 0; idx < CFG_TUH_HID; idx++) {
++        tuh_itf_info_t info;
++
++        if (!tuh_hid_itf_get_info(tp_daddr, idx, &info))
++            continue;
++
++        for (int slot = 0; slot < tp_stage.n_itf; slot++)
++            if (tp_stage.itf[slot].itf_num == info.desc.bInterfaceNumber)
++                tp_host_idx[slot] = (int8_t)idx;
++    }
++}
++
++/* Read everything we need to impersonate the trackpad */
++static bool tp_capture(tp_profile_t *p) {
++    uint16_t actual = 0;
++
++    memset(p, 0, sizeof(*p));
++
++    /* Device descriptor */
++    if (!tp_ctrl(0x80, TUSB_REQ_GET_DESCRIPTOR, TUSB_DESC_DEVICE << 8, 0, tp_cfg_buf, sizeof(tusb_desc_device_t), &actual)
++        || actual < sizeof(tusb_desc_device_t))
++        return false;
++    memcpy(&p->dev, tp_cfg_buf, sizeof(tusb_desc_device_t));
++
++    /* Configuration descriptor: header first to learn the length, then all of it */
++    if (!tp_ctrl(0x80, TUSB_REQ_GET_DESCRIPTOR, TUSB_DESC_CONFIGURATION << 8, 0, tp_cfg_buf, 9, &actual) || actual < 9)
++        return false;
++
++    uint16_t total = tu_u16(tp_cfg_buf[3], tp_cfg_buf[2]);
++    if (total > sizeof(tp_cfg_buf))
++        total = sizeof(tp_cfg_buf);
++
++    if (!tp_ctrl(0x80, TUSB_REQ_GET_DESCRIPTOR, TUSB_DESC_CONFIGURATION << 8, 0, tp_cfg_buf, total, &actual))
++        return false;
++    if (actual < total)
++        total = actual;
++
++    p->cfg_attr  = tp_cfg_buf[7];
++    p->cfg_power = tp_cfg_buf[8];
++
++    /* Walk the descriptors and pick out the HID interfaces */
++    tp_itf_t *cur = NULL;
++    for (uint16_t off = 0; off + 2 <= total;) {
++        const uint8_t *d = &tp_cfg_buf[off];
++        uint8_t dlen = d[0];
++
++        if (dlen < 2 || off + dlen > total)
++            break;
++
++        switch (d[1]) {
++            case TUSB_DESC_INTERFACE:
++                cur = NULL;
++                if (dlen >= 9 && d[5] == TUSB_CLASS_HID && d[3] == 0 && p->n_itf < TP_MAX_ITF) {
++                    cur           = &p->itf[p->n_itf++];
++                    cur->itf_num  = d[2];
++                    cur->subclass = d[6];
++                    cur->protocol = d[7];
++                } else {
++                    tp_log("skipping interface %u (class %02x)", d[2], d[5]);
++                }
++                break;
++
++            case HID_DESC_TYPE_HID:
++                if (cur != NULL && dlen >= 9) {
++                    cur->bcd_hid   = tu_u16(d[3], d[2]);
++                    cur->country   = d[4];
++                    cur->rdesc_len = tu_u16(d[8], d[7]);
++                }
++                break;
++
++            case TUSB_DESC_ENDPOINT:
++                if (cur != NULL && dlen >= 7 && (d[3] & 0x03) == TUSB_XFER_INTERRUPT) {
++                    uint16_t size = tu_u16(d[5], d[4]) & 0x7ff;
++                    if (size > TP_PKT_MAX)
++                        size = TP_PKT_MAX;
++
++                    if (d[2] & 0x80) {
++                        cur->ep_in          = d[2];
++                        cur->ep_in_interval = d[6];
++                        cur->ep_in_size     = size;
++                    } else {
++                        cur->ep_out          = d[2];
++                        cur->ep_out_interval = d[6];
++                        cur->ep_out_size     = size;
++                    }
++                }
++                break;
++        }
++        off += dlen;
++    }
++
++    if (p->n_itf == 0)
++        return false;
++
++    /* HID report descriptors, one per interface */
++    for (int slot = 0; slot < p->n_itf; slot++) {
++        tp_itf_t *itf = &p->itf[slot];
++
++        if (itf->rdesc_len == 0 || p->pool_len + itf->rdesc_len > TP_RDESC_POOL || !itf->ep_in)
++            return false;
++
++        itf->rdesc_off = p->pool_len;
++        if (!tp_ctrl(0x81, TUSB_REQ_GET_DESCRIPTOR, HID_DESC_TYPE_REPORT << 8, itf->itf_num,
++                     &p->pool[itf->rdesc_off], itf->rdesc_len, &actual)
++            || actual != itf->rdesc_len)
++            return false;
++
++        p->pool_len += itf->rdesc_len;
++
++        /* We want full reports, never the simplified boot protocol */
++        if (itf->subclass == HID_SUBCLASS_BOOT)
++            tp_ctrl(0x21, HID_REQ_CONTROL_SET_PROTOCOL, HID_PROTOCOL_REPORT, itf->itf_num, NULL, 0, NULL);
++
++        tp_log("itf %u: sub=%u proto=%u rdesc=%u ep_in=%02x/%u ep_out=%02x", itf->itf_num, itf->subclass,
++               itf->protocol, itf->rdesc_len, itf->ep_in, itf->ep_in_size, itf->ep_out);
++    }
++
++    /* Strings: manufacturer, product, serial */
++    const uint8_t str_idx[3] = {p->dev.iManufacturer, p->dev.iProduct, p->dev.iSerialNumber};
++    for (int i = 0; i < 3; i++) {
++        uint8_t *raw = (uint8_t *)p->str[i];
++
++        if (!str_idx[i])
++            continue;
++
++        if (!tp_ctrl(0x80, TUSB_REQ_GET_DESCRIPTOR, (TUSB_DESC_STRING << 8) | str_idx[i], 0x0409, raw,
++                     sizeof(p->str[i]), &actual)
++            || actual < 2) {
++            raw[0] = 0;
++            continue;
++        }
++
++        /* Fix up the length in case the string was longer than our buffer */
++        if (raw[0] > actual)
++            raw[0] = (uint8_t)(actual & ~1u);
++    }
++
++    p->magic = TP_MAGIC;
++    return true;
++}
++
++static bool tp_profile_ok(const tp_profile_t *p, uint16_t len) {
++    if (len < offsetof(tp_profile_t, pool) || p->magic != TP_MAGIC)
++        return false;
++    if (p->n_itf == 0 || p->n_itf > TP_MAX_ITF || p->pool_len > TP_RDESC_POOL)
++        return false;
++    if (len != offsetof(tp_profile_t, pool) + p->pool_len)
++        return false;
++
++    for (int slot = 0; slot < p->n_itf; slot++)
++        if ((uint32_t)p->itf[slot].rdesc_off + p->itf[slot].rdesc_len > p->pool_len)
++            return false;
++
++    return true;
++}
++
++static uint16_t tp_profile_len(const tp_profile_t *p) {
++    return (uint16_t)(offsetof(tp_profile_t, pool) + p->pool_len);
++}
++
++/* Send a report towards a given computer: local queue or over to the other board */
++static void tp_deliver(uint8_t output, uint8_t slot, const uint8_t *data, uint16_t len) {
++    if (output == BOARD_ROLE) {
++        static tp_in_t in;
++        in.slot = slot;
++        in.len  = (uint8_t)len;
++        memcpy(in.data, data, len);
++        queue_try_add(&tp_in_q, &in);
++    } else {
++        uint8_t meta[4] = {slot, 0, 0, 0};
++        tp_send_frame(TP_S_INPUT, meta, data, len);
++    }
++}
++
++static inline bool tp_is_mt_report(const uint8_t *r, uint16_t len) {
++    return len >= TP_MT_HEADER_LEN && r[0] == TP_MT_REPORT_ID && ((len - TP_MT_HEADER_LEN) % TP_MT_FINGER_LEN) == 0;
++}
++
++#if TP_POINTER_MODE
++/* Experimental: DeskHop owns the pointer. A single finger is converted into
++   DeskHop's own absolute mouse (so dragging across the screen edge switches
++   computers), and hidden from the computer. Two or more fingers pass through
++   untouched, so native gestures still work. Returns the new report length. */
++static uint16_t tp_pointer_filter(uint8_t *r, uint16_t len) {
++    static bool tracking     = false;
++    static uint8_t finger_id = 0;
++    static int32_t last_x, last_y, rem_x, rem_y, travel;
++    static uint64_t down_at;
++    static bool hidden_sent = false;
++    static uint8_t buttons  = 0;
++
++    device_t *state    = &global_state;
++    mouse_values_t val = {0};
++    int fingers        = (len - TP_MT_HEADER_LEN) / TP_MT_FINGER_LEN;
++
++    if (fingers != 1) {
++        if (tracking) {
++            tracking = false;
++
++            /* A short, still touch is a tap */
++            if (TP_TAP_TO_CLICK && fingers == 0 && !buttons && travel < TP_TAP_MAX_TRAVEL
++                && time_us_64() - down_at < TP_TAP_MAX_US) {
++                val.buttons = 1;
++                process_mouse_values(&val);
++            }
++
++            /* Whatever we held down gets released */
++            val.buttons = 0;
++            buttons     = 0;
++            process_mouse_values(&val);
++        }
++        hidden_sent = false;
++        return len;
++    }
++
++    const uint8_t *f = &r[TP_MT_HEADER_LEN];
++    uint8_t id = f[8] & 0x0f;
++    int32_t x  = ((int32_t)((uint32_t)f[1] << 27 | (uint32_t)f[0] << 19)) >> 19;
++    int32_t y  = -(((int32_t)((uint32_t)f[3] << 30 | (uint32_t)f[2] << 22 | (uint32_t)f[1] << 14)) >> 19);
++
++    if (!tracking || id != finger_id) {
++        tracking  = true;
++        finger_id = id;
++        last_x    = x;
++        last_y    = y;
++        rem_x = rem_y = travel = 0;
++        down_at   = time_us_64();
++    }
++
++    int32_t dx = x - last_x;
++    int32_t dy = y - last_y;
++    last_x = x;
++    last_y = y;
++    travel += abs(dx) + abs(dy);
++
++    /* Scale trackpad units to mouse counts, carrying the remainder so slow moves aren't lost */
++    rem_x += dx * TP_POINTER_SCALE_NUM;
++    rem_y += dy * TP_POINTER_SCALE_NUM;
++    val.move_x = rem_x / TP_POINTER_SCALE_DEN;
++    val.move_y = rem_y / TP_POINTER_SCALE_DEN;
++    rem_x -= val.move_x * TP_POINTER_SCALE_DEN;
++    rem_y -= val.move_y * TP_POINTER_SCALE_DEN;
++
++    buttons     = r[1] & 0x01;
++    val.buttons = buttons;
++
++    if (val.move_x || val.move_y || val.buttons != state->mouse_buttons)
++        process_mouse_values(&val);
++
++    /* Tell the computer once that no fingers are down, then stay quiet */
++    if (hidden_sent)
++        return 0;
++
++    hidden_sent = true;
++    r[1]        = 0;
++    return TP_MT_HEADER_LEN;
++}
++#endif
++
++/* Raw report from the trackpad (called from the TinyUSB host callback) */
++void tp_host_input(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len) {
++    static uint8_t buf[TP_PKT_MAX];
++
++    if (dev_addr != tp_daddr || !tp_owner || len == 0)
++        return;
++
++    int slot = tp_slot_from_instance(instance);
++    if (slot < 0)
++        return;
++
++    if (len > TP_PKT_MAX)
++        len = TP_PKT_MAX;
++    memcpy(buf, report, len);
++
++    if (tp_is_mt_report(buf, len)) {
++#if TP_POINTER_MODE
++        len = tp_pointer_filter(buf, len);
++        if (len == 0)
++            return;
++#endif
++        memcpy(tp_last_hdr, buf, TP_MT_HEADER_LEN);
++        tp_last_slot  = (uint8_t)slot;
++        tp_touch_live = (len > TP_MT_HEADER_LEN) || (buf[1] != 0);
++    }
++
++    tp_deliver(global_state.active_output, (uint8_t)slot, buf, len);
++    global_state.last_activity[global_state.active_output] = time_us_64();
++}
++
++static void tp_record_set(const tp_job_t *job) {
++    if (job->rtype != HID_REPORT_TYPE_FEATURE || job->len > TP_RECORD_MAX || job->output >= NUM_SCREENS)
++        return;
++
++    tp_record_t *table = tp_records[job->output];
++    tp_record_t *slot  = NULL;
++
++    for (int i = 0; i < TP_MAX_RECORDS; i++) {
++        if (table[i].used && table[i].slot == job->slot && table[i].rid == job->rid) {
++            slot = &table[i];
++            break;
++        }
++        if (!table[i].used && slot == NULL)
++            slot = &table[i];
++    }
++
++    if (slot == NULL)
++        return;
++
++    slot->used = true;
++    slot->slot = job->slot;
++    slot->rid  = job->rid;
++    slot->len  = (uint8_t)job->len;
++    slot->seq  = ++tp_record_seq;
++    memcpy(slot->data, job->data, job->len);
++}
++
++/* Put the trackpad into the state the given computer last asked for */
++static void tp_replay(uint8_t output) {
++    tp_record_t *table = tp_records[output];
++    uint32_t after     = 0;
++
++    for (int n = 0; n < TP_MAX_RECORDS; n++) {
++        tp_record_t *next = NULL;
++
++        /* Oldest first */
++        for (int i = 0; i < TP_MAX_RECORDS; i++)
++            if (table[i].used && table[i].seq > after && (next == NULL || table[i].seq < next->seq))
++                next = &table[i];
++
++        if (next == NULL)
++            break;
++
++        after = next->seq;
++        memcpy(tp_ctrl_buf, next->data, next->len);
++        bool ok = tp_ctrl(0x21, HID_REQ_CONTROL_SET_REPORT, (HID_REPORT_TYPE_FEATURE << 8) | next->rid,
++                          tp_stage.itf[next->slot].itf_num, tp_ctrl_buf, next->len, NULL);
++        tp_log("replay o=%u itf=%u id=%02x len=%u %s", output, next->slot, next->rid, next->len, ok ? "ok" : "FAIL");
++        (void)ok;
++    }
++}
++
++static void tp_get_respond(const tp_job_t *job, bool ok, uint16_t len) {
++    if (job->remote) {
++        uint8_t meta[4] = {job->slot, job->rid, job->token, ok};
++        tp_send_frame(TP_S_GET_RESP, meta, tp_ctrl_buf, ok ? len : 0);
++        return;
++    }
++
++    if (job->token != tp_get_token)
++        return;
++
++    memcpy(tp_get_buf, tp_ctrl_buf, len);
++    tp_get_len  = len;
++    tp_get_ok   = ok;
++    tp_get_done = true;
++}
++
++static void tp_run_job(tp_job_t *job) {
++    bool ok        = false;
++    uint16_t actual = 0;
++
++    if (!tp_owner || job->slot >= tp_stage.n_itf) {
++        if (job->op == TP_OP_GET)
++            tp_get_respond(job, false, 0);
++        return;
++    }
++
++    uint8_t itf_num = tp_stage.itf[job->slot].itf_num;
++
++    switch (job->op) {
++        case TP_OP_GET:
++            ok = tp_ctrl(0xa1, HID_REQ_CONTROL_GET_REPORT, (job->rtype << 8) | job->rid, itf_num, tp_ctrl_buf,
++                         job->len, &actual);
++            tp_log("GET o=%u itf=%u t=%u id=%02x len=%u -> %s %u [%02x %02x %02x %02x]", job->output, job->slot,
++                   job->rtype, job->rid, job->len, ok ? "ok" : "FAIL", actual, tp_ctrl_buf[0], tp_ctrl_buf[1],
++                   tp_ctrl_buf[2], tp_ctrl_buf[3]);
++            tp_get_respond(job, ok, actual);
++            break;
++
++        case TP_OP_SET:
++            tp_record_set(job);
++
++            if (!TP_FORWARD_INACTIVE_SETS && job->output != global_state.active_output) {
++                tp_log("SET o=%u itf=%u t=%u id=%02x len=%u recorded only", job->output, job->slot, job->rtype,
++                       job->rid, job->len);
++                break;
++            }
++
++            memcpy(tp_ctrl_buf, job->data, job->len);
++            ok = tp_ctrl(0x21, HID_REQ_CONTROL_SET_REPORT, (job->rtype << 8) | job->rid, itf_num, tp_ctrl_buf,
++                         job->len, NULL);
++            tp_log("SET o=%u itf=%u t=%u id=%02x len=%u %s [%02x %02x %02x %02x]", job->output, job->slot,
++                   job->rtype, job->rid, job->len, ok ? "ok" : "FAIL", job->data[0], job->data[1], job->data[2],
++                   job->data[3]);
++            break;
++
++        case TP_OP_OUT:
++            /* Only the computer in control gets to drive the haptics and such */
++            if (job->output == global_state.active_output && tp_host_idx[job->slot] >= 0)
++                tuh_hid_send_report(tp_daddr, (uint8_t)tp_host_idx[job->slot], 0, job->data, job->len);
++            break;
++    }
++}
++
++/* Push a few packets of the profile to the other board per pass, so its receiver keeps up */
++static void tp_profile_tx(void) {
++    const uint8_t *raw = (const uint8_t *)&tp_stage;
++    uint16_t total     = tp_profile_len(&tp_stage);
++
++    if (tp_prof_tx_off < 0) {
++        if (!tp_prof_tx_request || !tp_owner)
++            return;
++
++        tp_prof_tx_request = false;
++        if (tp_send_begin(TP_S_PROFILE, NULL, raw, total))
++            tp_prof_tx_off = 0;
++        return;
++    }
++
++    for (int i = 0; i < 4 && tp_prof_tx_off < total; i++) {
++        uint16_t sent = tp_send_data(TP_S_PROFILE, raw + tp_prof_tx_off, total - tp_prof_tx_off);
++        if (!sent)
++            return;
++        tp_prof_tx_off += sent;
++    }
++
++    if (tp_prof_tx_off >= total)
++        tp_prof_tx_off = -1;
++}
++
++void tp_host_task(device_t *state) {
++    static tp_job_t job;
++    static uint8_t last_active   = 0xff;
++    static uint64_t next_sync_req = 0;
++    static uint8_t attempts       = 0;
++
++    /* Trackpad was just plugged in and all of its interfaces have settled */
++    if (tp_capture_pending && time_us_64() >= tp_capture_at) {
++        tp_capture_pending = false;
++
++        if (tp_stage_valid) {
++            /* Seen before (replugged, or the other board told us about it): just pick it back up */
++            tp_map_instances();
++            tp_owner = true;
++            tp_replay(state->active_output);
++            tp_log("trackpad re-attached");
++        } else {
++            static tp_profile_t fresh;
++
++            if (tp_capture(&fresh)) {
++                memcpy(&tp_stage, &fresh, sizeof(tp_stage));
++                tp_map_instances();
++                tp_stage_valid   = true;
++                tp_owner         = true;
++                tp_apply_pending = true;
++                tp_log("captured %04x:%04x, %u interfaces, %u descriptor bytes", fresh.dev.idVendor,
++                       fresh.dev.idProduct, fresh.n_itf, fresh.pool_len);
++            } else if (tp_daddr && ++attempts < 5) {
++                /* Maybe it wasn't quite ready, give it another go shortly */
++                tp_capture_pending = true;
++                tp_capture_at      = time_us_64() + 300000;
++                tp_log("capture failed, retrying");
++            } else {
++                tp_log("capture FAILED");
++            }
++        }
++
++        tp_prof_tx_request = tp_owner;
++        last_active        = state->active_output;
++    }
++
++    tp_profile_tx();
++
++    /* Nobody has told us about a trackpad yet, keep asking the other board */
++    if (!tp_stage_valid && !tp_daddr && time_us_64() >= next_sync_req) {
++        uart_packet_t packet = {.type = TP_SYNC_REQ_MSG};
++        queue_try_add(&state->uart_tx_queue, &packet);
++        next_sync_req = time_us_64() + 1000000;
++    }
++
++    if (tp_owner && last_active != state->active_output) {
++        /* Lift any fingers / release the click on the computer we just left */
++        if (tp_touch_live && last_active < NUM_SCREENS) {
++            tp_last_hdr[1] = 0;
++            tp_deliver(last_active, tp_last_slot, tp_last_hdr, TP_MT_HEADER_LEN);
++            tp_touch_live = false;
++        }
++
++        last_active = state->active_output;
++        tp_replay(last_active);
++    }
++
++    if (queue_try_remove(&tp_job_q, &job))
++        tp_run_job(&job);
++}
++
++/* ---------------- UART handlers (core 1) ---------------- */
++
++static void tp_rx_commit(uint8_t stream, tp_rx_t *rx) {
++    static tp_job_t job;
++    static tp_in_t in;
++
++    if (tp_sum(rx->buf, rx->len) != rx->sum)
++        return;
++
++    switch (stream) {
++        case TP_S_PROFILE:
++            /* We have our own trackpad, or already know this one */
++            if (tp_daddr || !tp_profile_ok(&tp_rx_prof, rx->len))
++                break;
++            if (tp_stage_valid && memcmp(&tp_stage, &tp_rx_prof, rx->len) == 0)
++                break;
++
++            tp_stage_valid = false;
++            memset(&tp_stage, 0, sizeof(tp_stage));
++            memcpy(&tp_stage, &tp_rx_prof, rx->len);
++            tp_stage_valid   = true;
++            tp_apply_pending = true;
++            break;
++
++        case TP_S_INPUT:
++            if (rx->len == 0 || rx->len > TP_PKT_MAX)
++                break;
++            in.slot = rx->meta[0];
++            in.len  = (uint8_t)rx->len;
++            memcpy(in.data, rx->buf, rx->len);
++            queue_try_add(&tp_in_q, &in);
++            break;
++
++        case TP_S_SET:
++            job = (tp_job_t){.op = rx->meta[3] >> 4, .output = rx->meta[3] & 0x0f, .slot = rx->meta[0],
++                             .rtype = rx->meta[1], .rid = rx->meta[2], .remote = true, .len = rx->len};
++            if (job.op != TP_OP_SET && job.op != TP_OP_OUT)
++                break;
++            memcpy(job.data, rx->buf, rx->len);
++            queue_try_add(&tp_job_q, &job);
++            break;
++
++        case TP_S_GET_RESP:
++            if (rx->meta[2] != tp_get_token)
++                break;
++            memcpy(tp_get_buf, rx->buf, rx->len);
++            tp_get_len  = rx->len;
++            tp_get_ok   = rx->meta[3];
++            tp_get_done = true;
++            break;
++    }
++}
++
++void handle_tp_frame_begin_msg(uart_packet_t *packet, device_t *state) {
++    uint8_t stream = packet->data[0];
++
++    if (stream >= TP_S_COUNT)
++        return;
++
++    tp_rx_t *rx = &tp_rx[stream];
++    rx->len  = tu_u16(packet->data[2], packet->data[1]);
++    rx->sum  = packet->data[3];
++    rx->got  = 0;
++    rx->open = rx->len <= rx->cap;
++    memcpy(rx->meta, &packet->data[4], 4);
++
++    if (rx->open && rx->len == 0) {
++        rx->open = false;
++        tp_rx_commit(stream, rx);
++    }
++}
++
++void handle_tp_frame_data_msg(uart_packet_t *packet, device_t *state) {
++    uint8_t stream = packet->data[0];
++
++    if (stream >= TP_S_COUNT || !tp_rx[stream].open)
++        return;
++
++    tp_rx_t *rx    = &tp_rx[stream];
++    uint16_t chunk = rx->len - rx->got;
++    if (chunk > 7)
++        chunk = 7;
++
++    memcpy(rx->buf + rx->got, &packet->data[1], chunk);
++    rx->got += chunk;
++
++    if (rx->got >= rx->len) {
++        rx->open = false;
++        tp_rx_commit(stream, rx);
++    }
++}
++
++/* The other board's computer wants a report from our trackpad */
++void handle_tp_get_req_msg(uart_packet_t *packet, device_t *state) {
++    static tp_job_t job;
++
++    job = (tp_job_t){.op = TP_OP_GET, .slot = packet->data[0], .rtype = packet->data[1], .rid = packet->data[2],
++                     .token = packet->data[3], .len = tu_u16(packet->data[5], packet->data[4]),
++                     .output = packet->data[6], .remote = true};
++
++    if (job.len > TP_CTRL_MAX)
++        job.len = TP_CTRL_MAX;
++
++    if (!tp_owner) {
++        tp_get_respond(&job, false, 0);
++        return;
++    }
++
++    queue_try_add(&tp_job_q, &job);
++}
++
++/* The other board has no profile yet, send ours if we have one */
++void handle_tp_sync_req_msg(uart_packet_t *packet, device_t *state) {
++    if (tp_owner && tp_prof_tx_off < 0)
++        tp_prof_tx_request = true;
++}
++
++void tp_init(void) {
++    queue_init(&tp_in_q, sizeof(tp_in_t), 32);
++    queue_init(&tp_job_q, sizeof(tp_job_t), 6);
++#ifdef DH_DEBUG
++    queue_init(&tp_log_q, sizeof(tp_logline_t), 24);
++#endif
++    for (int slot = 0; slot < TP_MAX_ITF; slot++)
++        tp_host_idx[slot] = -1;
++}
++
++#else /* !TP_ENABLE */
++
++volatile uint8_t tp_itf_base = 0;
++
++void tp_init(void) {}
++bool tp_active(void) { return false; }
++const tp_profile_t *tp_profile(void) { return NULL; }
++void tp_device_task(device_t *state) {}
++uint16_t tp_dev_get_report(uint8_t slot, uint8_t report_id, uint8_t report_type, uint8_t *buffer, uint16_t reqlen) { return 0; }
++void tp_dev_set_report(uint8_t slot, uint8_t report_id, uint8_t report_type, const uint8_t *buffer, uint16_t len) {}
++bool tp_host_is_trackpad(uint8_t dev_addr) { return false; }
++void tp_host_itf_mounted(uint8_t dev_addr, uint8_t instance) {}
++bool tp_host_unmounted(uint8_t dev_addr) { return false; }
++void tp_host_input(uint8_t dev_addr, uint8_t instance, const uint8_t *report, uint16_t len) {}
++void tp_host_task(device_t *state) {}
++void handle_tp_frame_begin_msg(uart_packet_t *packet, device_t *state) {}
++void handle_tp_frame_data_msg(uart_packet_t *packet, device_t *state) {}
++void handle_tp_get_req_msg(uart_packet_t *packet, device_t *state) {}
++void handle_tp_sync_req_msg(uart_packet_t *packet, device_t *state) {}
++
++#endif
+diff --git a/src/uart.c b/src/uart.c
+index 9c5073a..169f440 100644
+--- a/src/uart.c
++++ b/src/uart.c
+@@ -89,6 +89,12 @@ const uart_handler_t uart_handler[] = {
+ 
+     {.type = HEARTBEAT_MSG, .handler = handle_heartbeat_msg},
+     {.type = PROXY_PACKET_MSG, .handler = handle_proxy_msg},
++
++    /* Magic Trackpad passthrough */
++    {.type = TP_FRAME_BEGIN_MSG, .handler = handle_tp_frame_begin_msg},
++    {.type = TP_FRAME_DATA_MSG, .handler = handle_tp_frame_data_msg},
++    {.type = TP_GET_REQ_MSG, .handler = handle_tp_get_req_msg},
++    {.type = TP_SYNC_REQ_MSG, .handler = handle_tp_sync_req_msg},
+ };
+ 
+ void process_packet(uart_packet_t *packet, device_t *state) {
+diff --git a/src/usb.c b/src/usb.c
+index 3122145..45d58f9 100644
+--- a/src/usb.c
++++ b/src/usb.c
+@@ -54,6 +54,10 @@ uint16_t tud_hid_get_report_cb(uint8_t instance,
+                                hid_report_type_t report_type,
+                                uint8_t *buffer,
+                                uint16_t request_len) {
++    /* Cloned trackpad interfaces: ask the real trackpad */
++    if (tp_active() && instance < tp_itf_base)
++        return tp_dev_get_report(instance, report_id, report_type, buffer, request_len);
++
+     /* Only the keyboard interface answers GET reports. */
+     if (instance != ITF_NUM_HID)
+         return 0;
+@@ -87,6 +91,16 @@ void tud_hid_set_report_cb(uint8_t instance,
+                            uint8_t const *buffer,
+                            uint16_t bufsize) {
+ 
++    /* Cloned trackpad interfaces: hand it to the real trackpad */
++    if (tp_active() && instance < tp_itf_base) {
++        tp_dev_set_report(instance, report_id, report_type, buffer, bufsize);
++        return;
++    }
++
++    /* Nothing else is addressed to interfaces other than ours */
++    if (instance != ITF_NUM_HID && instance != ITF_NUM_HID_VENDOR)
++        return;
++
+     /* We received a report on the config report ID */
+     if (instance == ITF_NUM_HID_VENDOR && report_id == REPORT_ID_VENDOR) {
+         /* Security - only if config mode is enabled are we allowed to do anything. While the report_id
+@@ -171,6 +185,9 @@ void tud_cdc_rx_cb(uint8_t itf) {
+ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
+     uint8_t itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+ 
++    if (tp_host_unmounted(dev_addr))
++        return;
++
+     if (dev_addr > MAX_DEVICES || instance >= MAX_INTERFACES)
+         return;
+ 
+@@ -197,6 +214,14 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
+ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len) {
+     uint8_t itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+ 
++    /* A Magic Trackpad isn't treated as a mouse, it gets passed through whole */
++    if (tp_host_is_trackpad(dev_addr)) {
++        tp_host_itf_mounted(dev_addr, instance);
++        blink_led(&global_state);
++        send_value(ENABLE, FLASH_LED_MSG);
++        return;
++    }
++
+     if (dev_addr > MAX_DEVICES || instance >= MAX_INTERFACES)
+         return;
+ 
+@@ -264,6 +289,13 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
+ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len) {
+     uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
+ 
++    /* Magic Trackpad reports are forwarded raw */
++    if (tp_host_is_trackpad(dev_addr)) {
++        tp_host_input(dev_addr, instance, report, len);
++        tuh_hid_receive_report(dev_addr, instance);
++        return;
++    }
++
+     if (dev_addr > MAX_DEVICES || instance >= MAX_INTERFACES)
+         return;
+ 
+diff --git a/src/usb_descriptors.c b/src/usb_descriptors.c
+index d7c1893..229101c 100644
+--- a/src/usb_descriptors.c
++++ b/src/usb_descriptors.c
+@@ -28,8 +28,21 @@ tusb_desc_device_t const desc_device = DEVICE_DESCRIPTOR(0x1209, 0xc000);
+ uint8_t const *tud_descriptor_device_cb(void) {
+     if (global_state.config_mode_active)
+         return (uint8_t const *)&desc_device_config;
+-    else
+-        return (uint8_t const *)&desc_device;
++
++    /* Passing a Magic Trackpad through: we are that trackpad now */
++    if (tp_active()) {
++        static tusb_desc_device_t desc_device_tp;
++
++        desc_device_tp                    = tp_profile()->dev;
++        desc_device_tp.bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE;
++        desc_device_tp.iManufacturer      = 0x01;
++        desc_device_tp.iProduct           = 0x02;
++        desc_device_tp.iSerialNumber      = 0x03;
++        desc_device_tp.bNumConfigurations = 0x01;
++        return (uint8_t const *)&desc_device_tp;
++    }
++
++    return (uint8_t const *)&desc_device;
+ }
+ 
+ //--------------------------------------------------------------------+
+@@ -57,10 +70,16 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
+         if (instance == ITF_NUM_HID_VENDOR)
+             return desc_hid_report_vendor;
+ 
+-    switch(instance) {
+-        case ITF_NUM_HID:
++    /* Cloned trackpad interfaces come first, ours follow */
++    if (tp_active() && instance < tp_itf_base) {
++        const tp_profile_t *tp = tp_profile();
++        return &tp->pool[tp->itf[instance].rdesc_off];
++    }
++
++    switch(instance - tp_itf_base) {
++        case ITF_IDX_HID:
+             return desc_hid_report;
+-        case ITF_NUM_HID_REL_M:
++        case ITF_IDX_HID_REL_M:
+             return desc_hid_report_relmouse;
+         default:
+             return desc_hid_report;
+@@ -128,6 +147,14 @@ uint16_t const *tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
+        pico_get_unique_board_id_string(serial_number, sizeof(serial_number));
+     }
+ 
++    /* Use the trackpad's own manufacturer, product and serial strings when impersonating it */
++    if (tp_active() && !global_state.config_mode_active && index >= STRID_MANUFACTURER && index <= STRID_SERIAL) {
++        const uint16_t *cloned = tp_profile()->str[index - STRID_MANUFACTURER];
++
++        if ((cloned[0] & 0xff) >= 2)
++            return cloned;
++    }
++
+     if (index == 0) {
+         memcpy(&_desc_str[1], string_desc_arr[0], 2);
+         chr_count = 1;
+@@ -199,20 +226,20 @@ uint8_t const desc_configuration[] = {
+     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 500),
+ 
+     // Interface number, string index, protocol, report descriptor len, EP In address, size & polling interval
+-    TUD_HID_DESCRIPTOR(ITF_NUM_HID,
++    TUD_HID_DESCRIPTOR(ITF_IDX_HID,
+                        STRID_PRODUCT,
+                        HID_ITF_PROTOCOL_KEYBOARD,
+                        sizeof(desc_hid_report),
+                        EPNUM_HID,
+-                       CFG_TUD_HID_EP_BUFSIZE,
++                       DH_HID_EP_SIZE,
+                        1),
+ 
+-    TUD_HID_DESCRIPTOR(ITF_NUM_HID_REL_M,
++    TUD_HID_DESCRIPTOR(ITF_IDX_HID_REL_M,
+                        STRID_MOUSE,
+                        HID_ITF_PROTOCOL_NONE,
+                        sizeof(desc_hid_report_relmouse),
+                        EPNUM_HID_REL_M,
+-                       CFG_TUD_HID_EP_BUFSIZE,
++                       DH_HID_EP_SIZE,
+                        1),
+ #ifdef DH_DEBUG
+     // Interface number, string index, EP notification address and size, EP data address (out, in) and size.
+@@ -226,28 +253,28 @@ uint8_t const desc_configuration_config[] = {
+     TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL_CONFIG, 0, CONFIG_TOTAL_LEN_CFG, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 500),
+ 
+     // Interface number, string index, protocol, report descriptor len, EP In address, size & polling interval
+-    TUD_HID_DESCRIPTOR(ITF_NUM_HID,
++    TUD_HID_DESCRIPTOR(ITF_IDX_HID,
+                        STRID_PRODUCT,
+                        HID_ITF_PROTOCOL_KEYBOARD,
+                        sizeof(desc_hid_report),
+                        EPNUM_HID,
+-                       CFG_TUD_HID_EP_BUFSIZE,
++                       DH_HID_EP_SIZE,
+                        1),
+ 
+-    TUD_HID_DESCRIPTOR(ITF_NUM_HID_REL_M,
++    TUD_HID_DESCRIPTOR(ITF_IDX_HID_REL_M,
+                        STRID_MOUSE,
+                        HID_ITF_PROTOCOL_NONE,
+                        sizeof(desc_hid_report_relmouse),
+                        EPNUM_HID_REL_M,
+-                       CFG_TUD_HID_EP_BUFSIZE,
++                       DH_HID_EP_SIZE,
+                        1),
+ 
+-    TUD_HID_DESCRIPTOR(ITF_NUM_HID_VENDOR,
++    TUD_HID_DESCRIPTOR(ITF_IDX_HID_VENDOR,
+                        STRID_VENDOR,
+                        HID_ITF_PROTOCOL_NONE,
+                        sizeof(desc_hid_report_vendor),
+                        EPNUM_HID_VENDOR,
+-                       CFG_TUD_HID_EP_BUFSIZE,
++                       DH_HID_EP_SIZE,
+                        1),
+ 
+     TUD_MSC_DESCRIPTOR(ITF_NUM_MSC,
+@@ -262,11 +289,101 @@ uint8_t const desc_configuration_config[] = {
+ #endif
+ };
+ 
++
++//--------------------------------------------------------------------+
++// Magic Trackpad passthrough: configuration built at runtime
++//--------------------------------------------------------------------+
++
++/* Find an endpoint number nobody is using yet (bit n set = endpoint n taken) */
++static uint8_t tp_alloc_ep(uint16_t *used) {
++    for (uint8_t ep = 1; ep < 16; ep++) {
++        if (!(*used & (1u << ep))) {
++            *used |= (1u << ep);
++            return ep;
++        }
++    }
++    return 0;
++}
++
++/* The trackpad's HID interfaces, exactly as it describes them (same interface
++   numbers and endpoint addresses), followed by DeskHop's keyboard and mouse. */
++static uint8_t const *tp_build_configuration(void) {
++    static uint8_t desc[TUD_CONFIG_DESC_LEN + TP_MAX_ITF * TUD_HID_INOUT_DESC_LEN + 2 * TUD_HID_DESC_LEN + 80];
++    const tp_profile_t *tp = tp_profile();
++    uint16_t in_used = 0, out_used = 0;
++    uint8_t *p = desc + TUD_CONFIG_DESC_LEN;
++    uint8_t itf_count = 0;
++
++    for (int i = 0; i < tp->n_itf; i++) {
++        const tp_itf_t *itf = &tp->itf[i];
++        uint8_t cloned[] = {
++            /* Interface */
++            9, TUSB_DESC_INTERFACE, itf->itf_num, 0, (uint8_t)(itf->ep_out ? 2 : 1), TUSB_CLASS_HID, itf->subclass, itf->protocol, 0,
++            /* HID */
++            9, HID_DESC_TYPE_HID, U16_TO_U8S_LE(itf->bcd_hid), itf->country, 1, HID_DESC_TYPE_REPORT, U16_TO_U8S_LE(itf->rdesc_len),
++            /* Endpoint in */
++            7, TUSB_DESC_ENDPOINT, itf->ep_in, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(itf->ep_in_size), itf->ep_in_interval,
++            /* Endpoint out, if the trackpad has one */
++            7, TUSB_DESC_ENDPOINT, itf->ep_out, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(itf->ep_out_size), itf->ep_out_interval,
++        };
++        uint8_t len = itf->ep_out ? sizeof(cloned) : sizeof(cloned) - 7;
++
++        memcpy(p, cloned, len);
++        p += len;
++
++        in_used |= 1u << (itf->ep_in & 0x0f);
++        if (itf->ep_out)
++            out_used |= 1u << (itf->ep_out & 0x0f);
++
++        /* Our own interfaces are numbered after the highest one the trackpad uses */
++        if (itf->itf_num >= itf_count)
++            itf_count = itf->itf_num + 1;
++    }
++
++    uint8_t ep_kbd = 0x80 | tp_alloc_ep(&in_used);
++    uint8_t ep_rel = 0x80 | tp_alloc_ep(&in_used);
++
++    uint8_t own[] = {
++        TUD_HID_DESCRIPTOR(itf_count + ITF_IDX_HID, STRID_PRODUCT, HID_ITF_PROTOCOL_KEYBOARD,
++                           sizeof(desc_hid_report), ep_kbd, DH_HID_EP_SIZE, 1),
++        TUD_HID_DESCRIPTOR(itf_count + ITF_IDX_HID_REL_M, STRID_MOUSE, HID_ITF_PROTOCOL_NONE,
++                           sizeof(desc_hid_report_relmouse), ep_rel, DH_HID_EP_SIZE, 1),
++    };
++    memcpy(p, own, sizeof(own));
++    p += sizeof(own);
++    itf_count += 2;
++
++#ifdef DH_DEBUG
++    uint8_t ep_notif = 0x80 | tp_alloc_ep(&in_used);
++    uint8_t ep_cdc   = tp_alloc_ep(&in_used);
++    out_used |= 1u << ep_cdc;
++
++    uint8_t cdc[] = {
++        TUD_CDC_DESCRIPTOR(itf_count, STRID_DEBUG, ep_notif, 8, ep_cdc, 0x80 | ep_cdc, CFG_TUD_CDC_EP_BUFSIZE),
++    };
++    memcpy(p, cdc, sizeof(cdc));
++    p += sizeof(cdc);
++    itf_count += 2;
++#endif
++    (void)out_used;
++
++    uint16_t total = (uint16_t)(p - desc);
++    uint8_t header[] = {
++        TUD_CONFIG_DESCRIPTOR(1, itf_count, 0, total, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 500),
++    };
++    memcpy(desc, header, sizeof(header));
++
++    return desc;
++}
++
+ uint8_t const *tud_descriptor_configuration_cb(uint8_t index) {
+     (void)index; // for multiple configurations
+ 
+     if (global_state.config_mode_active)
+         return desc_configuration_config;
+-    else
+-        return desc_configuration;
++
++    if (tp_active())
++        return tp_build_configuration();
++
++    return desc_configuration;
+ }
